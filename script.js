@@ -1,538 +1,476 @@
-/* ==========================================================================
-   JARVIS — application logic
-   ========================================================================== */
-(() => {
-    'use strict';
+'use strict';
 
-    /* ---------- element refs ---------- */
-    const outputArea = document.getElementById('output-area');
-    const inputField = document.getElementById('user-input');
-    const sendBtn = document.getElementById('send-btn');
-    const micBtn = document.getElementById('mic-btn');
-    const reactor = document.getElementById('reactor');
-    const waveform = document.getElementById('waveform');
-    const statusDot = document.getElementById('status-dot');
-    const statusLabel = document.getElementById('status-label');
-    const clockEl = document.getElementById('clock');
-    const themeToggle = document.getElementById('theme-toggle');
-    const activityLog = document.getElementById('activity-log');
-    const notesList = document.getElementById('notes-list');
-    const notesCount = document.getElementById('notes-count');
-    const readoutDate = document.getElementById('readout-date');
-    const readoutUptime = document.getElementById('readout-uptime');
-    const readoutBattery = document.getElementById('readout-battery');
-    const readoutVoice = document.getElementById('readout-voice');
-    const readoutMic = document.getElementById('readout-mic');
+/* ================= Helpers & refs ================= */
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-    /* ---------- persistent state ---------- */
-    const store = {
-        get notes() { try { return JSON.parse(localStorage.getItem('jarvis_notes') || '[]'); } catch { return []; } },
-        set notes(v) { localStorage.setItem('jarvis_notes', JSON.stringify(v)); },
-        get voiceOn() { return localStorage.getItem('jarvis_voice') !== 'off'; },
-        set voiceOn(v) { localStorage.setItem('jarvis_voice', v ? 'on' : 'off'); },
-        get theme() { return localStorage.getItem('jarvis_theme') || 'cyan'; },
-        set theme(v) { localStorage.setItem('jarvis_theme', v); },
-    };
+const outputArea = $('output-area');
+const inputField = $('user-input');
+const micBtn = $('mic-btn');
+const voiceToggle = $('voice-toggle');
+const sendBtn = $('send-btn');
+const suggestionBar = $('suggestion-bar');
 
-    let history = [];
-    let historyIndex = -1;
-    const bootTime = Date.now();
+/* ================= State (persisted) ================= */
+let voiceEnabled = localStorage.getItem('jvs_voice') !== '0';
+let history = [];
+let notes = [];
+try { history = JSON.parse(localStorage.getItem('jvs_history')) || []; } catch (e) { }
+try { notes = JSON.parse(localStorage.getItem('jvs_notes')) || []; } catch (e) { }
 
-    /* ==========================================================================
-       BOOT
-       ========================================================================== */
-    function boot() {
-        if (store.theme === 'amber') document.body.classList.add('theme-amber');
-        readoutVoice.textContent = store.voiceOn ? 'ON' : 'OFF';
-        renderNotes();
-        tickClock();
-        setInterval(tickClock, 1000);
-        setStatus('idle');
-        logActivity('System booted.');
-        initBattery();
-    }
+const saveHistory = () => localStorage.setItem('jvs_history', JSON.stringify(history.slice(-80)));
+const saveNotes = () => localStorage.setItem('jvs_notes', JSON.stringify(notes));
 
-    function tickClock() {
-        const now = new Date();
-        clockEl.textContent = now.toLocaleTimeString([], { hour12: false });
-        readoutDate.textContent = now.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
-        const uptimeMs = Date.now() - bootTime;
-        const s = Math.floor(uptimeMs / 1000) % 60;
-        const m = Math.floor(uptimeMs / 60000) % 60;
-        const h = Math.floor(uptimeMs / 3600000);
-        readoutUptime.textContent = [h, m, s].map(n => String(n).padStart(2, '0')).join(':');
-    }
+/* ================= Audio & voice ================= */
+const sfx = {
+    hello: $('hello-sound'),
+    service: $('AtyourService'),
+    intro: $('Introduction'),
+    battery: $('Batterylow'),
+    reboot: $('reboot'),
+};
 
-    function initBattery() {
-        if (navigator.getBattery) {
-            navigator.getBattery().then(bat => {
-                const update = () => {
-                    readoutBattery.textContent = `${Math.round(bat.level * 100)}%${bat.charging ? ' ⚡' : ''}`;
-                };
-                update();
-                bat.addEventListener('levelchange', update);
-                bat.addEventListener('chargingchange', update);
-            }).catch(() => { readoutBattery.textContent = 'N/A'; });
-        } else {
-            readoutBattery.textContent = 'N/A';
+function playSfx(key) {
+    if (!voiceEnabled || !sfx[key]) return;
+    sfx[key].currentTime = 0;
+    sfx[key].play().catch(() => { });
+}
+
+if ('speechSynthesis' in window) speechSynthesis.onvoiceschanged = () => speechSynthesis.getVoices();
+
+function speak(text) {
+    if (!voiceEnabled || !('speechSynthesis' in window)) return;
+    const clean = text.replace(/[\n•]/g, '. ').replace(/\s+/g, ' ').slice(0, 300);
+    const u = new SpeechSynthesisUtterance(clean);
+    u.rate = 1; u.pitch = 0.85;
+    const voice = speechSynthesis.getVoices().find(v => /daniel|george|uk english male|en-gb/i.test(v.name + v.lang));
+    if (voice) u.voice = voice;
+    speechSynthesis.speak(u);
+}
+
+voiceToggle.textContent = voiceEnabled ? '🔊' : '🔇';
+voiceToggle.addEventListener('click', () => {
+    voiceEnabled = !voiceEnabled;
+    localStorage.setItem('jvs_voice', voiceEnabled ? '1' : '0');
+    voiceToggle.textContent = voiceEnabled ? '🔊' : '🔇';
+    if (!voiceEnabled && 'speechSynthesis' in window) speechSynthesis.cancel();
+    Object.values(sfx).forEach(a => a.pause());
+    if (voiceEnabled) jarvisSay('Voice modules online, sir.', { typeIt: false });
+});
+
+/* ================= Messages ================= */
+const scrollBottom = () => { outputArea.scrollTop = outputArea.scrollHeight; };
+
+function addUserMsg(text) {
+    const d = document.createElement('div');
+    d.className = 'user-command';
+    d.textContent = 'You ▸ ' + text;
+    outputArea.appendChild(d);
+    scrollBottom();
+    history.push({ who: 'user', text });
+    saveHistory();
+}
+
+async function jarvisSay(text, { sfxKey = null, tts = true, typeIt = true } = {}) {
+    const d = document.createElement('div');
+    d.className = 'jarvis-response';
+    outputArea.appendChild(d);
+
+    if (sfxKey) playSfx(sfxKey);
+
+    if (typeIt) {
+        const speed = text.length > 140 ? 8 : 14;
+        for (let i = 0; i < text.length; i++) {
+            d.textContent += text[i];
+            if (i % 3 === 0) scrollBottom();
+            await sleep(speed);
         }
-    }
-
-    /* ==========================================================================
-       STATUS / REACTOR STATE
-       ========================================================================== */
-    function setStatus(state) {
-        statusDot.className = 'status-dot';
-        reactor.className = '';
-        waveform.classList.remove('active');
-        switch (state) {
-            case 'idle':
-                statusDot.classList.add('on');
-                statusLabel.textContent = 'ONLINE';
-                break;
-            case 'thinking':
-                statusDot.classList.add('busy');
-                statusLabel.textContent = 'PROCESSING';
-                break;
-            case 'listening':
-                statusDot.classList.add('listening');
-                statusLabel.textContent = 'LISTENING';
-                reactor.classList.add('listening');
-                readoutMic.textContent = 'LIVE';
-                break;
-            case 'speaking':
-                statusDot.classList.add('busy');
-                statusLabel.textContent = 'SPEAKING';
-                reactor.classList.add('speaking');
-                waveform.classList.add('active');
-                animateWaveform();
-                break;
-        }
-        if (state !== 'listening') readoutMic.textContent = 'IDLE';
-    }
-
-    let waveformTimer = null;
-    function animateWaveform() {
-        clearInterval(waveformTimer);
-        const bars = waveform.querySelectorAll('span');
-        waveformTimer = setInterval(() => {
-            bars.forEach(b => { b.style.height = waveform.classList.contains('active') ? `${4 + Math.random() * 16}px` : '4px'; });
-        }, 110);
-    }
-    function stopWaveform() {
-        clearInterval(waveformTimer);
-        waveform.classList.remove('active');
-        waveform.querySelectorAll('span').forEach(b => b.style.height = '4px');
-    }
-
-    /* ==========================================================================
-       LOGGING / NOTES
-       ========================================================================== */
-    function logActivity(text) {
-        const li = document.createElement('li');
-        const t = new Date().toLocaleTimeString([], { hour12: false });
-        li.innerHTML = `<b>${t}</b> — ${text}`;
-        activityLog.insertBefore(li, activityLog.firstChild);
-        while (activityLog.children.length > 8) activityLog.removeChild(activityLog.lastChild);
-    }
-
-    function renderNotes() {
-        const notes = store.notes;
-        notesCount.textContent = `(${notes.length})`;
-        notesList.innerHTML = '';
-        if (notes.length === 0) {
-            notesList.innerHTML = '<li class="notes-empty">No notes yet. Try "note: pick up dry cleaning".</li>';
-            return;
-        }
-        notes.forEach((n, i) => {
-            const li = document.createElement('li');
-            li.textContent = n;
-            const del = document.createElement('span');
-            del.className = 'note-del';
-            del.textContent = '✕';
-            del.title = 'Delete note';
-            del.onclick = () => {
-                const updated = store.notes.filter((_, idx) => idx !== i);
-                store.notes = updated;
-                renderNotes();
-                logActivity('Note removed.');
-            };
-            li.appendChild(del);
-            notesList.appendChild(li);
-        });
-    }
-
-    /* ==========================================================================
-       SPEECH SYNTHESIS (voice output)
-       ========================================================================== */
-    let preferredVoice = null;
-    function pickVoice() {
-        const voices = speechSynthesis.getVoices();
-        preferredVoice =
-            voices.find(v => /Daniel|Google UK English Male|Arthur|Alex/i.test(v.name)) ||
-            voices.find(v => /en-GB/i.test(v.lang) && /male/i.test(v.name)) ||
-            voices.find(v => /en/i.test(v.lang)) ||
-            voices[0] || null;
-    }
-    if ('speechSynthesis' in window) {
-        speechSynthesis.onvoiceschanged = pickVoice;
-        pickVoice();
-    }
-
-    function speak(text) {
-        if (!store.voiceOn || !('speechSynthesis' in window)) return;
-        speechSynthesis.cancel();
-        const utter = new SpeechSynthesisUtterance(text);
-        if (preferredVoice) utter.voice = preferredVoice;
-        utter.rate = 1.0;
-        utter.pitch = 0.85;
-        utter.onstart = () => setStatus('speaking');
-        utter.onend = () => { stopWaveform(); setStatus('idle'); };
-        utter.onerror = () => { stopWaveform(); setStatus('idle'); };
-        speechSynthesis.speak(utter);
-    }
-
-    /* ==========================================================================
-       SPEECH RECOGNITION (voice input)
-       ========================================================================== */
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    let recognizer = null;
-    let isRecording = false;
-
-    if (SpeechRecognition) {
-        recognizer = new SpeechRecognition();
-        recognizer.lang = 'en-US';
-        recognizer.interimResults = false;
-        recognizer.maxAlternatives = 1;
-
-        recognizer.onstart = () => { isRecording = true; micBtn.classList.add('recording'); setStatus('listening'); };
-        recognizer.onend = () => { isRecording = false; micBtn.classList.remove('recording'); if (statusLabel.textContent === 'LISTENING') setStatus('idle'); };
-        recognizer.onerror = () => { isRecording = false; micBtn.classList.remove('recording'); setStatus('idle'); };
-        recognizer.onresult = (e) => {
-            const transcript = e.results[0][0].transcript;
-            inputField.value = transcript;
-            handleSubmit();
-        };
     } else {
-        micBtn.disabled = true;
-        micBtn.title = 'Voice input not supported in this browser';
-        micBtn.style.opacity = 0.35;
+        d.textContent = text;
     }
+    scrollBottom();
+    if (tts) speak(text);
+    history.push({ who: 'jarvis', text });
+    saveHistory();
+}
 
-    micBtn.addEventListener('click', () => {
-        if (!recognizer) return;
-        if (isRecording) { recognizer.stop(); } else { try { recognizer.start(); } catch (_) { } }
+function showTyping() {
+    const d = document.createElement('div');
+    d.className = 'jarvis-response typing-indicator';
+    d.innerHTML = '<span></span><span></span><span></span>';
+    outputArea.appendChild(d);
+    scrollBottom();
+    return d;
+}
+
+function restoreHistory() {
+    if (!history.length) return false;
+    const note = document.createElement('div');
+    note.className = 'system-note';
+    note.textContent = '— previous session restored —';
+    outputArea.appendChild(note);
+    history.forEach((m) => {
+        const d = document.createElement('div');
+        d.className = m.who === 'user' ? 'user-command' : 'jarvis-response';
+        d.textContent = (m.who === 'user' ? 'You ▸ ' : '') + m.text;
+        outputArea.appendChild(d);
     });
+    scrollBottom();
+    return true;
+}
 
-    /* ==========================================================================
-       OPTIONAL LOCAL AUDIO CUES (best-effort — silently ignored if missing)
-       ========================================================================== */
-    function tryPlayLocal(id) {
-        const el = document.getElementById(id);
-        if (!el) return false;
-        el.currentTime = 0;
-        const p = el.play();
-        if (p && p.catch) p.catch(() => { }); // ignore missing-file / autoplay errors
-        return true;
-    }
+/* ================= Feature utilities ================= */
+const WEATHER_CODES = {
+    0: 'a clear sky', 1: 'mainly clear skies', 2: 'partly cloudy skies', 3: 'overcast skies',
+    45: 'fog', 48: 'freezing fog', 51: 'light drizzle', 53: 'drizzle', 55: 'heavy drizzle',
+    61: 'light rain', 63: 'rain', 65: 'heavy rain', 71: 'light snow', 73: 'snow', 75: 'heavy snow',
+    80: 'rain showers', 81: 'rain showers', 82: 'violent rain showers',
+    95: 'a thunderstorm', 96: 'a thunderstorm with hail', 99: 'a thunderstorm with heavy hail',
+};
 
-    /* ==========================================================================
-       TYPEWRITER OUTPUT
-       ========================================================================== */
-    function printUser(text) {
-        const div = document.createElement('div');
-        div.className = 'user-command';
-        div.innerHTML = `<strong>You</strong>${escapeHtml(text)}`;
-        outputArea.appendChild(div);
-        scrollToBottom();
-    }
+async function getWeather() {
+    if (!navigator.geolocation) throw 'geolocation is unavailable in this browser';
+    const pos = await new Promise((res, rej) =>
+        navigator.geolocation.getCurrentPosition(res, () => rej('location access was denied'), { timeout: 9000 })
+    );
+    const { latitude, longitude } = pos.coords;
+    const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true`);
+    if (!r.ok) throw 'the weather service is unreachable';
+    const w = (await r.json()).current_weather;
+    return `Currently ${WEATHER_CODES[w.weathercode] || 'unidentified conditions'} at your location, sir — ${Math.round(w.temperature)}°C with winds at ${Math.round(w.windspeed)} km/h.`;
+}
 
-    function printJarvis(text, { speakToo = true, cueId = null } = {}) {
-        const div = document.createElement('div');
-        div.className = 'jarvis-response';
-        outputArea.appendChild(div);
-        scrollToBottom();
+async function batteryResponse() {
+    if (!navigator.getBattery) return 'This browser does not expose battery diagnostics, sir.';
+    const b = await navigator.getBattery();
+    const pct = Math.round(b.level * 100);
+    if (b.charging) return `Battery is at ${pct}% and charging, sir.`;
+    if (pct <= 20) return `Warning, sir — battery power is running low at ${pct}%. May I suggest you charge it soon?`;
+    const remain = Number.isFinite(b.dischargingTime) && b.dischargingTime > 0
+        ? ` Roughly ${Math.round(b.dischargingTime / 60)} minutes remaining.` : '';
+    return `Battery is at ${pct}%, sir.${remain}`;
+}
 
-        if (cueId) tryPlayLocal(cueId);
-        if (speakToo) speak(text);
-        else setStatus('idle');
+function calculate(expr) {
+    const clean = String(expr).replace(/[^0-9+\-*/().% ]/g, '').trim();
+    if (!clean || !/[0-9]/.test(clean)) return null;
+    try {
+        const val = Function('"use strict"; return (' + clean + ')')();
+        return (typeof val === 'number' && isFinite(val)) ? Math.round(val * 1e6) / 1e6 : null;
+    } catch { return null; }
+}
 
-        let i = 0;
-        const speed = Math.max(6, 22 - Math.floor(text.length / 40));
-        const timer = setInterval(() => {
-            div.textContent += text.charAt(i);
-            i++;
-            scrollToBottom();
-            if (i >= text.length) clearInterval(timer);
-        }, speed);
-    }
+/* ================= Command registry ================= */
+const jokes = [
+    "Why don't scientists trust atoms? Because they make up everything!",
+    "I told my computer I needed a break — it said 'no problem, I'll go to sleep.'",
+    "Why did the developer go broke? Because he used up all his cache.",
+    "I would tell you a UDP joke, but you might not get it.",
+    "Why do Java developers wear glasses? Because they don't C#.",
+];
 
-    function scrollToBottom() {
-        const wrap = document.getElementById('jarvis-output');
-        wrap.scrollTop = wrap.scrollHeight;
-    }
+const quotes = [
+    '"The best way out is always through." — Robert Frost',
+    '"Sometimes you gotta run before you can walk." — Tony Stark',
+    '"Genius is one percent inspiration, ninety-nine percent perspiration." — Thomas Edison',
+    '"It always seems impossible until it is done." — Nelson Mandela',
+];
 
-    function escapeHtml(str) {
-        return str.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-    }
+const commands = [
+    {
+        test: /^(i am back|i'?m back|i'?m here)/i, sfxKey: 'hello',
+        run: () => pick([
+            'Welcome back, sir. All systems are online and running at optimal capacity.',
+            "Good to have you back, sir. I've kept everything warm for you.",
+        ])
+    },
 
-    /* ==========================================================================
-       COMMAND DEFINITIONS
-       ========================================================================== */
-    const jokes = [
-        "Why don't scientists trust atoms? Because they make up everything.",
-        "I would tell you a UDP joke, but you might not get it.",
-        "There are 10 types of people: those who understand binary, and those who don't.",
-        "Why do programmers prefer dark mode? Because light attracts bugs.",
-        "I've got a great joke about arc reactors, but it needs more power.",
-    ];
+    {
+        test: /\b(hello|hi|hey|greetings)\b/i, sfxKey: 'service',
+        run: () => pick([
+            'At your service, sir.',
+            'Hello, sir. How may I be of assistance?',
+            'Good day, sir. All systems nominal.',
+        ])
+    },
 
-    function safeEval(expr) {
-        if (!/^[0-9+\-*/().\s%^]+$/.test(expr)) return null;
-        try {
-            const normalized = expr.replace(/\^/g, '**');
-            // eslint-disable-next-line no-new-func
-            const val = Function(`"use strict"; return (${normalized})`)();
-            return Number.isFinite(val) ? val : null;
-        } catch { return null; }
-    }
+    {
+        test: /(introduce yourself|who are you|what are you)/i, sfxKey: 'intro',
+        run: () => 'Allow me to introduce myself. I am JARVIS, a virtual artificial intelligence, here to assist you with a variety of tasks as best I can — 24 hours a day, 7 days a week. Importing all preferences from home interface. Systems are now fully operational.'
+    },
 
-    async function fetchWeather(place) {
-        try {
-            const geoRes = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(place)}&count=1`);
-            const geo = await geoRes.json();
-            if (!geo.results || !geo.results.length) return `I couldn't find a location called "${place}", sir.`;
-            const { latitude, longitude, name, country } = geo.results[0];
-            const wRes = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,wind_speed_10m,relative_humidity_2m`);
-            const w = await wRes.json();
-            const c = w.current;
-            if (!c) return `I retrieved coordinates for ${name}, but the forecast service didn't respond, sir.`;
-            return `Currently in ${name}, ${country}: ${c.temperature_2m}°C, humidity ${c.relative_humidity_2m}%, wind ${c.wind_speed_10m} km/h.`;
-        } catch {
-            return "I couldn't reach the weather service — check the connection, sir.";
+    {
+        test: /who (made|created|built) you/i,
+        run: () => 'I was crafted with HTML, CSS and JavaScript by my brilliant creator, sir. A fine engineer indeed.'
+    },
+
+    {
+        test: /\bthank(s| you)\b/i,
+        run: () => pick(['Always a pleasure, sir.', "That's what I'm here for, sir."])
+    },
+
+    { test: /\btime\b/i, run: () => `The current time is ${new Date().toLocaleTimeString()}.` },
+
+    {
+        test: /\bdate\b|\btoday'?s date\b/i,
+        run: () => `Today is ${new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}.`
+    },
+
+    { test: /\bbatter/i, run: batteryResponse },
+
+    {
+        test: /\bweather\b/i,
+        run: async () => {
+            try { return await getWeather(); }
+            catch (e) { return `I couldn't check the weather, sir — ${e}.`; }
         }
-    }
+    },
 
-    function greetingByTime() {
-        const h = new Date().getHours();
-        if (h < 5) return 'burning the midnight oil, sir';
-        if (h < 12) return 'good morning, sir';
-        if (h < 17) return 'good afternoon, sir';
-        if (h < 21) return 'good evening, sir';
-        return 'still up, sir';
-    }
-
-    /* Each rule: { test: (lowerInput) => bool, run: (raw, lower) => string | Promise<string> } */
-    const rules = [
-        {
-            test: l => /\bi'?m back\b|^i am back/.test(l),
-            run: () => "Welcome back, sir. Systems are already spun up — feel free to grab a coffee while I finish the last checks.",
-        },
-        {
-            test: l => /^hey\b|^hi\b|^hello\b/.test(l),
-            run: () => `At your service — ${greetingByTime()}.`,
-        },
-        {
-            test: l => l.includes('introduce yourself') || l.includes('who are you'),
-            run: () => "I am JARVIS — a virtual assistant here to help with information, quick calculations, notes, reminders, and a bit of conversation. All systems operational.",
-        },
-        {
-            test: l => l.includes('battery'),
-            run: () => readoutBattery.textContent && readoutBattery.textContent !== '—'
-                ? `Current battery level is ${readoutBattery.textContent}.`
-                : "I can't read battery data on this device, sir.",
-            cueId: 'Batterylow',
-        },
-        {
-            test: l => /^weather|weather (in|for)/.test(l),
-            run: async (raw, l) => {
-                const match = raw.match(/weather (?:in|for)\s+(.+)/i);
-                const place = match ? match[1].trim() : null;
-                if (!place) return "Tell me a city — for example, 'weather in Lahore'.";
-                return await fetchWeather(place);
-            },
-        },
-        {
-            test: l => l.includes('what time') || l === 'time' || l.includes("what's the time"),
-            run: () => `The current time is ${new Date().toLocaleTimeString()}.`,
-        },
-        {
-            test: l => l.includes('date') && !l.includes('update'),
-            run: () => `Today's date is ${new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}.`,
-        },
-        {
-            test: l => /^calculate|^calc\b|^what is [\d.]/.test(l),
-            run: (raw) => {
-                const expr = raw.replace(/^calculate|^calc\b|^what is/i, '').trim();
-                const result = safeEval(expr);
-                return result === null ? "I couldn't evaluate that expression, sir." : `${expr} = ${result}`;
-            },
-        },
-        {
-            test: l => l.startsWith('note:') || l.startsWith('note to self:') || l.startsWith('remember'),
-            run: (raw) => {
-                const content = raw.replace(/^note to self:|^note:|^remember (that )?/i, '').trim();
-                if (!content) return "What would you like me to note, sir?";
-                const notes = store.notes;
-                notes.push(content);
-                store.notes = notes;
-                renderNotes();
-                logActivity('Note saved.');
-                return `Noted: "${content}".`;
-            },
-        },
-        {
-            test: l => l.includes('show notes') || l === 'notes',
-            run: () => {
-                const notes = store.notes;
-                if (!notes.length) return "You have no notes saved, sir.";
-                return `You have ${notes.length} note${notes.length > 1 ? 's' : ''}:\n${notes.map((n, i) => `${i + 1}. ${n}`).join('\n')}`;
-            },
-        },
-        {
-            test: l => l.includes('clear notes'),
-            run: () => { store.notes = []; renderNotes(); logActivity('Notes cleared.'); return "All notes cleared, sir."; },
-        },
-        {
-            test: l => /set (a )?timer for/.test(l),
-            run: (raw) => {
-                const m = raw.match(/(\d+)\s*(second|minute|hour)/i);
-                if (!m) return "Tell me a duration — for example, 'set a timer for 5 minutes'.";
-                const n = parseInt(m[1], 10);
-                const unit = m[2].toLowerCase();
-                const ms = unit.startsWith('hour') ? n * 3600000 : unit.startsWith('minute') ? n * 60000 : n * 1000;
-                setTimeout(() => {
-                    printJarvis(`Timer complete — ${n} ${unit}${n > 1 ? 's' : ''} have elapsed, sir.`);
-                    logActivity('Timer finished.');
-                }, ms);
-                logActivity(`Timer set: ${n} ${unit}(s).`);
-                return `Timer set for ${n} ${unit}${n > 1 ? 's' : ''}, sir. I'll let you know.`;
-            },
-        },
-        {
-            test: l => l.includes('reboot') || l.includes('restart'),
-            run: () => { setTimeout(() => location.reload(), 1800); return "Rebooting interface — see you in a moment, sir."; },
-            cueId: 'reboot',
-        },
-        {
-            test: l => l.includes('shutdown') || l.includes('shut down') || l.includes('goodbye') || l.includes('go to sleep'),
-            run: () => { document.body.style.transition = 'opacity 1.5s ease'; setTimeout(() => document.body.style.opacity = '0.15', 400); return "Shutting down non-essential systems. Goodbye, sir."; },
-        },
-        {
-            test: l => l.includes('clear') && (l.includes('screen') || l.includes('output') || l === 'clear'),
-            run: () => { outputArea.innerHTML = ''; return "Display cleared."; },
-        },
-        {
-            test: l => l.includes('open music'),
-            run: () => { window.open('https://open.spotify.com', '_blank'); return "Opening your music player, sir."; },
-        },
-        {
-            test: l => l.startsWith('search'),
-            run: (raw) => {
-                const q = raw.replace(/^search( for)?/i, '').trim();
-                if (!q) return "What would you like me to search for, sir?";
-                window.open(`https://www.google.com/search?q=${encodeURIComponent(q)}`, '_blank');
-                return `Searching for "${q}", sir.`;
-            },
-        },
-        {
-            test: l => l.includes('play game'),
-            run: () => "Launching a quick diversion — try asking me for 'a joke' while I warm things up. Full game integration coming soon, sir.",
-        },
-        {
-            test: l => l === 'help' || l.includes('what can you do'),
-            run: () => "I can handle: time · date · weather in <city> · calculate <expression> · note: <text> · show notes · set a timer for <n> minutes · joke · battery · search <query> · reboot · shutdown · clear. Speak or type any of these.",
-        },
-        {
-            test: l => l.includes('news'),
-            run: () => { window.open('https://news.google.com', '_blank'); return "Opening the latest headlines, sir."; },
-        },
-        {
-            test: l => l.includes('settings'),
-            run: () => "Use the ◐ icon in the top-right to switch the interface palette. More settings are on the way, sir.",
-        },
-        {
-            test: l => l.includes('joke'),
-            run: () => jokes[Math.floor(Math.random() * jokes.length)],
-        },
-        {
-            test: l => l.includes('mute') || l.includes('voice off'),
-            run: () => { store.voiceOn = false; readoutVoice.textContent = 'OFF'; return "Voice output disabled."; },
-        },
-        {
-            test: l => l.includes('unmute') || l.includes('voice on'),
-            run: () => { store.voiceOn = true; readoutVoice.textContent = 'ON'; return "Voice output enabled."; },
-        },
-        {
-            test: l => l.includes('thank'),
-            run: () => "Always a pleasure, sir.",
-        },
-    ];
-
-    const fallbacks = [
-        "I'm not certain I follow — try 'help' to see what I can do.",
-        "That one's outside my current parameters, sir. Type 'help' for a list of commands.",
-        "I didn't quite catch a valid command there.",
-    ];
-
-    /* ==========================================================================
-       SUBMIT HANDLER
-       ========================================================================== */
-    async function handleSubmit() {
-        const raw = inputField.value.trim();
-        if (!raw) return;
-
-        history.push(raw);
-        historyIndex = history.length;
-
-        printUser(raw);
-        inputField.value = '';
-        setStatus('thinking');
-
-        const lower = raw.toLowerCase();
-        const matched = rules.find(r => r.test(lower));
-
-        await new Promise(res => setTimeout(res, 220)); // brief "thinking" beat
-
-        let response;
-        let cueId = null;
-        if (matched) {
-            response = await matched.run(raw, lower);
-            cueId = matched.cueId || null;
-            logActivity(`Command: "${raw.slice(0, 40)}"`);
-        } else {
-            response = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-            logActivity(`Unrecognized: "${raw.slice(0, 40)}"`);
+    {
+        test: /^(youtube|play on youtube)\s+(.+)/i,
+        run: (m) => {
+            window.open('https://www.youtube.com/results?search_query=' + encodeURIComponent(m[2]), '_blank');
+            return `Searching YouTube for "${m[2]}", sir.`;
         }
+    },
 
-        printJarvis(response, { cueId });
-    }
-
-    /* ==========================================================================
-       EVENTS
-       ========================================================================== */
-    sendBtn.addEventListener('click', handleSubmit);
-    inputField.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') { handleSubmit(); return; }
-        if (e.key === 'ArrowUp') {
-            if (historyIndex > 0) { historyIndex--; inputField.value = history[historyIndex]; }
-            e.preventDefault();
+    {
+        test: /^(search|google)\s+(.+)/i,
+        run: (m) => {
+            window.open('https://www.google.com/search?q=' + encodeURIComponent(m[2]), '_blank');
+            return `Searching the web for "${m[2]}", sir.`;
         }
-        if (e.key === 'ArrowDown') {
-            if (historyIndex < history.length - 1) { historyIndex++; inputField.value = history[historyIndex]; }
-            else { historyIndex = history.length; inputField.value = ''; }
-            e.preventDefault();
+    },
+
+    {
+        test: /\bplay (a )?game\b/i,
+        run: () => { window.open('https://chromedino.com', '_blank'); return 'Launching your game, sir. Good luck!'; }
+    },
+
+    {
+        test: /\b(open|play)\s+(some\s+)?music\b/i,
+        run: () => { window.open('https://music.youtube.com', '_blank'); return 'Opening your music, sir. Enjoy.'; }
+    },
+
+    {
+        test: /^(calculate|calc|solve)\s+(.+)/i,
+        run: (m) => {
+            const v = calculate(m[2]);
+            return v === null ? "I'm afraid that expression is beyond my calculator, sir." : `That would be ${v}, sir.`;
         }
-    });
+    },
 
-    document.querySelectorAll('.quick-btn').forEach(btn => {
-        btn.addEventListener('click', () => { inputField.value = btn.dataset.cmd; handleSubmit(); });
-    });
+    {
+        test: /^(what is|what's)\s+(.+)/i,
+        run: (m) => {
+            const v = calculate(m[2]);
+            return v === null ? "I can only compute numeric expressions for that phrasing, sir." : `That would be ${v}, sir.`;
+        }
+    },
 
-    themeToggle.addEventListener('click', () => {
-        document.body.classList.toggle('theme-amber');
-        store.theme = document.body.classList.contains('theme-amber') ? 'amber' : 'cyan';
-    });
+    {
+        test: /^[\d\s+\-*/().%]+$/,
+        run: (m) => {
+            const v = calculate(m[0]);
+            return v === null ? "That doesn't appear to be a valid expression, sir." : `That would be ${v}, sir.`;
+        }
+    },
 
-    boot();
+    {
+        test: /^(take a note|note down|make a note|note)\s*(?:that\s+|to\s+)?(.+)/i,
+        run: (m) => {
+            notes.push(m[2]); saveNotes();
+            return `Noted, sir: "${m[2]}". You now have ${notes.length} note(s).`;
+        }
+    },
+
+    {
+        test: /\b(read|show|list)\s+(my\s+)?notes?\b/i,
+        run: () => notes.length
+            ? 'Your notes, sir:\n' + notes.map((n, i) => `  ${i + 1}. ${n}`).join('\n')
+            : 'You have no notes yet, sir.'
+    },
+
+    { test: /\bclear notes\b/i, run: () => { notes = []; saveNotes(); return 'All notes cleared, sir.'; } },
+
+    {
+        test: /\btimer\b|\bremind me\b/i,
+        run: (m, raw) => {
+            const t = raw.match(/(\d+)\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)/i);
+            if (!t) return "How long should the timer be, sir? For example: 'set a timer for 5 minutes'.";
+            const n = +t[1], u = t[2].toLowerCase();
+            const ms = u.startsWith('h') ? n * 3600000 : u.startsWith('m') ? n * 60000 : n * 1000;
+            setTimeout(() => jarvisSay(`Sir, your ${n} ${u.replace(/s$/, '')} timer has finished.`, { sfxKey: 'battery' }), ms);
+            return `Timer set for ${n} ${u}, sir. I shall notify you.`;
+        }
+    },
+
+    { test: /\bjoke\b/i, run: () => pick(jokes) },
+    { test: /(inspire me|\bquote\b)/i, run: () => pick(quotes) },
+
+    {
+        test: /\bfull ?screen\b/i,
+        run: () => {
+            document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+            return 'Toggling fullscreen, sir.';
+        }
+    },
+
+    {
+        test: /^clear( chat| history| screen)?$/i,
+        run: () => { outputArea.innerHTML = ''; history = []; saveHistory(); return 'Chat log cleared, sir.'; }
+    },
+
+    {
+        test: /\bhelp\b|\bcommands?\b|what can you do/i,
+        run: () =>
+            `At your service, sir. Here are my current capabilities:
+
+•  time / date — current time & date
+•  battery — power diagnostics
+•  weather — local weather (location required)
+•  search <query> / youtube <query> — web & video search
+•  open music / play game — quick entertainment
+•  calculate <expression> — e.g. calculate 25*4+10
+•  take a note <text> / read notes / clear notes
+•  set a timer for <N> minutes
+•  joke / quote — something to smile about
+•  fullscreen / clear / reboot / shutdown
+•  or simply talk to me — say hello, thank me, ask who I am` },
+
+    {
+        test: /\breboot\b|\brestart\b/i, sfxKey: 'reboot',
+        run: () => { setTimeout(() => location.reload(), 2200); return 'Rebooting all systems, sir. Back in a moment.'; }
+    },
+
+    {
+        test: /\b(shutdown|shut down|goodbye)\b/i, sfxKey: 'reboot',
+        run: () => {
+            setTimeout(() => {
+                document.body.classList.add('shutdown');
+                setTimeout(() => window.close(), 1600);
+            }, 1800);
+            return 'Shutting down all systems. Goodbye, sir.';
+        }
+    },
+];
+
+/* ================= Core processing ================= */
+let busy = false;
+
+async function processCommand(forced) {
+    const raw = (typeof forced === 'string' ? forced : inputField.value).trim();
+    if (!raw || busy) return;
+    busy = true;
+    inputField.value = '';
+    addUserMsg(raw);
+
+    const typingEl = showTyping();
+    await sleep(350 + Math.random() * 250);
+    typingEl.remove();
+
+    const cmd = commands.find((c) => c.test.test(raw));
+    const response = cmd
+        ? await cmd.run(raw.match(cmd.test), raw)
+        : pick([
+            "I'm afraid I don't understand that command, sir. Type 'help' to see my capabilities.",
+            "My apologies, sir — that request is beyond my current protocols. Try 'help'.",
+        ]);
+
+    await jarvisSay(response, { sfxKey: cmd ? cmd.sfxKey : null });
+    busy = false;
+    inputField.focus();
+}
+
+/* ================= Input events ================= */
+sendBtn.addEventListener('click', () => processCommand());
+inputField.addEventListener('keydown', (e) => { if (e.key === 'Enter') processCommand(); });
+
+/* ================= Voice recognition ================= */
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null, listening = false;
+
+if (SR) {
+    recognition = new SR();
+    recognition.lang = 'en-US';
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+    recognition.onresult = (e) => processCommand(e.results[0][0].transcript);
+    recognition.onend = () => { listening = false; micBtn.classList.remove('listening'); };
+    recognition.onerror = (e) => {
+        listening = false; micBtn.classList.remove('listening');
+        jarvisSay("I didn't catch that, sir. " + (e.error === 'not-allowed' ? 'Microphone access was denied.' : 'Please try again.'), { typeIt: false });
+    };
+} else {
+    micBtn.disabled = true;
+    micBtn.title = 'Voice input not supported in this browser';
+}
+
+micBtn.addEventListener('click', () => {
+    if (!recognition) return jarvisSay('Voice recognition is not supported in this browser, sir.');
+    if (listening) { recognition.stop(); return; }
+    try { recognition.start(); listening = true; micBtn.classList.add('listening'); } catch (e) { }
+});
+
+/* ================= Clock & battery HUD ================= */
+function updateClock() {
+    const n = new Date();
+    $('clock').textContent = n.toLocaleTimeString('en-GB');
+    $('date-display').textContent = n.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+(async function initBattery() {
+    if (!navigator.getBattery) { $('battery-status').textContent = '⚡ BATT N/A'; return; }
+    const b = await navigator.getBattery();
+    const render = () => {
+        $('battery-status').textContent = `⚡ BATT ${Math.round(b.level * 100)}%${b.charging ? ' ⚡CHG' : ''}`;
+    };
+    render();
+    b.addEventListener('levelchange', render);
+    b.addEventListener('chargingchange', render);
 })();
+
+/* ================= Suggestion chips ================= */
+['Introduce yourself', "What's the time?", 'Weather', 'Tell me a joke',
+    'Calculate 25*4+10', 'Take a note buy coffee', 'Set a timer for 5 minutes', 'Help']
+    .forEach((s) => {
+        const b = document.createElement('button');
+        b.className = 'chip';
+        b.textContent = s;
+        b.onclick = () => processCommand(s);
+        suggestionBar.appendChild(b);
+    });
+
+/* ================= Boot sequence ================= */
+const bootLines = [
+    '[ BIOS ] MARK VII INTERFACE ............ OK',
+    '[ CORE ] Loading neural lattice ........ OK',
+    '[ NET  ] Establishing uplink ........... OK',
+    '[ AUD  ] Voice modules ................. OK',
+    '[ SEC  ] Running diagnostics ........... OK',
+    '',
+    'ALL SYSTEMS NOMINAL.',
+];
+
+$('boot-btn').addEventListener('click', async () => {
+    $('boot-btn').style.display = 'none';
+    playSfx('hello'); // user gesture — browser now allows audio
+    for (const line of bootLines) {
+        const el = document.createElement('div');
+        el.textContent = line;
+        $('boot-log').appendChild(el);
+        await sleep(180);
+    }
+    await sleep(500);
+    const bootScreen = $('boot-screen');
+    bootScreen.classList.add('boot-done');
+    setTimeout(() => bootScreen.remove(), 900);
+
+    const restored = restoreHistory();
+    jarvisSay(restored
+        ? 'Systems restored, sir. Welcome back.'
+        : 'Good day, sir. JARVIS online — all systems are fully operational. How may I assist you?');
+});
